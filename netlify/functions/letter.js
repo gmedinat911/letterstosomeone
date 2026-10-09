@@ -1,5 +1,5 @@
 const {createHash,randomBytes,timingSafeEqual}=require('node:crypto');
-const WINDOW=900000,COOKIE='wood_session',STATE='wood:state',LETTER='wood:letter',TOTAL='wood:total_reads';
+const DEFAULT_WINDOW=900000,COOKIE='wood_session',STATE='wood:state',LETTER='wood:letter',TOTAL='wood:total_reads';
 const H={'Cache-Control':'no-store, private, max-age=0','Content-Type':'application/json; charset=utf-8','X-Robots-Tag':'noindex, nofollow, noarchive','Referrer-Policy':'no-referrer'};
 const out=(statusCode,data,extra={})=>({statusCode,headers:{...H,...extra},body:JSON.stringify(data)}),hash=s=>createHash('sha256').update(String(s)).digest('hex'),eq=(a,b)=>timingSafeEqual(Buffer.from(hash(a),'hex'),Buffer.from(hash(b),'hex'));
 const ck=s=>Object.fromEntries((s||'').split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2));
@@ -12,5 +12,5 @@ if(s.revoked)return out(403,{status:'revoked'});if(b.action==='release'){if(s.ac
 if(s.active&&now<s.active.expiresAt){if(b.deviceId&&s.active.device===hash(b.deviceId)){s.active.session=tokenHash||s.active.session;await save(s);return out(200,{status:'open',expiresAt:s.active.expiresAt,letter})}if(tokenHash!==s.active.session){s.blockedAttempts=(s.blockedAttempts||0)+1;s.lastBlocked={ip:readerIp,at:now};await save(s);return out(409,{status:'active_elsewhere'})}return out(200,{status:'open',expiresAt:s.active.expiresAt,letter})}
 if(s.active&&now>=s.active.expiresAt){s.active=null;await save(s)}
 if(s.usedReads>=s.allowedReads)return out(410,{status:'expired'});
-const fresh=randomBytes(32).toString('hex');s.usedReads++;s.totalReads=Number(await redis(['INCR',TOTAL]));s.active={session:hash(fresh),device:b.deviceId?hash(b.deviceId):null,expiresAt:now+WINDOW,ip:readerIp,startedAt:now,meta:b.meta||null};s.lastReader={ip:readerIp,at:now,device:b.deviceId?hash(b.deviceId):null,meta:b.meta||null};await save(s);
+const fresh=randomBytes(32).toString('hex');s.usedReads++;s.totalReads=Number(await redis(['INCR',TOTAL]));const windowMs=(s.durationMinutes||15)*60000;s.active={session:hash(fresh),device:b.deviceId?hash(b.deviceId):null,expiresAt:now+windowMs,ip:readerIp,startedAt:now,meta:b.meta||null};s.lastReader={ip:readerIp,at:now,device:b.deviceId?hash(b.deviceId):null,meta:b.meta||null};await save(s);
 return out(200,{status:'open',expiresAt:s.active.expiresAt,letter},{'Set-Cookie':COOKIE+'='+fresh+'; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900'})}catch{return out(503,{status:'unavailable'})}};
