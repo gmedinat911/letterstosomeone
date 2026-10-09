@@ -1,17 +1,16 @@
 const {createHash,randomBytes,timingSafeEqual}=require('node:crypto');
-const WINDOW=15*60*1000,COOKIE='wood_session',STATE='wood:state';
-const headers={'Cache-Control':'no-store, private, max-age=0','Content-Type':'application/json; charset=utf-8','X-Robots-Tag':'noindex, nofollow, noarchive','Referrer-Policy':'no-referrer'};
-const json=(statusCode,data,extra={})=>({statusCode,headers:{...headers,...extra},body:JSON.stringify(data)});
-const hash=s=>createHash('sha256').update(String(s)).digest('hex');
-const equal=(a,b)=>{const x=Buffer.from(hash(a),'hex'),y=Buffer.from(hash(b),'hex');return timingSafeEqual(x,y)};
-const cookies=s=>Object.fromEntries((s||'').split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2));
-async function redis(cmd){const u=process.env.UPSTASH_REDIS_REST_URL,t=process.env.UPSTASH_REDIS_REST_TOKEN;if(!u||!t)throw Error();const r=await fetch(u,{method:'POST',headers:{Authorization:'Bearer '+t,'Content-Type':'application/json'},body:JSON.stringify(cmd)});const j=await r.json();if(!r.ok||j.error)throw Error();return j.result}
-async function state(){const raw=await redis(['GET',STATE]);return raw?JSON.parse(raw):{allowedReads:1,usedReads:0,revoked:false,active:null}}
-async function save(s){await redis(['SET',STATE,JSON.stringify(s)])}
-exports.handler=async event=>{if(event.httpMethod!=='POST')return json(405,{status:'invalid'});const key=process.env.LETTER_ACCESS_KEY,letter=process.env.LETTER_BODY_BASE64;if(!key||!letter)return json(503,{status:'not_configured'});let b;try{b=JSON.parse(event.body||'{}')}catch{return json(400,{status:'invalid'})}if(b.action!=='open'||typeof b.key!=='string'||!equal(b.key,key))return json(404,{status:'unavailable'});
-try{let s=await state();if(s.revoked)return json(403,{status:'revoked'});const now=Date.now(),c=cookies(event.headers.cookie||event.headers.Cookie)[COOKIE],ch=c?hash(c):null;
-if(s.active&&now<s.active.expiresAt){if(ch!==s.active.session)return json(409,{status:'active_elsewhere'});return json(200,{status:'open',expiresAt:s.active.expiresAt,letter:Buffer.from(letter,'base64').toString('utf8')})}
+const WINDOW=900000,COOKIE='wood_session',STATE='wood:state',LETTER='wood:letter';
+const H={'Cache-Control':'no-store, private, max-age=0','Content-Type':'application/json; charset=utf-8','X-Robots-Tag':'noindex, nofollow, noarchive','Referrer-Policy':'no-referrer'};
+const out=(statusCode,data,extra={})=>({statusCode,headers:{...H,...extra},body:JSON.stringify(data)}),hash=s=>createHash('sha256').update(String(s)).digest('hex'),eq=(a,b)=>timingSafeEqual(Buffer.from(hash(a),'hex'),Buffer.from(hash(b),'hex'));
+const ck=s=>Object.fromEntries((s||'').split(';').map(v=>v.trim().split('=').map(decodeURIComponent)).filter(v=>v.length===2));
+async function redis(cmd){const r=await fetch(process.env.UPSTASH_REDIS_REST_URL,{method:'POST',headers:{Authorization:'Bearer '+process.env.UPSTASH_REDIS_REST_TOKEN,'Content-Type':'application/json'},body:JSON.stringify(cmd)}),j=await r.json();if(!r.ok||j.error)throw Error();return j.result}
+async function get(){const x=await redis(['GET',STATE]);return x?JSON.parse(x):{allowedReads:1,usedReads:0,revoked:false,active:null,lastReader:null,blockedAttempts:0}}async function save(s){await redis(['SET',STATE,JSON.stringify(s)])}
+const ip=e=>(e.headers['x-nf-client-connection-ip']||e.headers['x-forwarded-for']||'unknown').split(',')[0].trim();
+exports.handler=async e=>{if(e.httpMethod!=='POST')return out(405,{status:'invalid'});let b;try{b=JSON.parse(e.body||'{}')}catch{return out(400,{status:'invalid'})}const key=process.env.LETTER_ACCESS_KEY;if(!key||typeof b.key!=='string'||!eq(b.key,key))return out(404,{status:'unavailable'});if(b.action!=='open')return out(400,{status:'invalid'});
+try{const letter=await redis(['GET',LETTER]);if(!letter)return out(503,{status:'letter_not_saved'});let s=await get(),now=Date.now(),readerIp=ip(e),token=ck(e.headers.cookie||e.headers.Cookie)[COOKIE],tokenHash=token?hash(token):null;
+if(s.revoked)return out(403,{status:'revoked'});
+if(s.active&&now<s.active.expiresAt){if(tokenHash!==s.active.session){s.blockedAttempts=(s.blockedAttempts||0)+1;s.lastBlocked={ip:readerIp,at:now};await save(s);return out(409,{status:'active_elsewhere'})}return out(200,{status:'open',expiresAt:s.active.expiresAt,letter})}
 if(s.active&&now>=s.active.expiresAt){s.active=null;await save(s)}
-if(s.usedReads>=s.allowedReads)return json(410,{status:'expired'});
-const token=randomBytes(32).toString('hex');s.usedReads++;s.active={session:hash(token),expiresAt:now+WINDOW};await save(s);
-return json(200,{status:'open',expiresAt:s.active.expiresAt,letter:Buffer.from(letter,'base64').toString('utf8')},{'Set-Cookie':COOKIE+'='+token+'; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900'})}catch{return json(503,{status:'unavailable'})}};
+if(s.usedReads>=s.allowedReads)return out(410,{status:'expired'});
+const fresh=randomBytes(32).toString('hex');s.usedReads++;s.active={session:hash(fresh),expiresAt:now+WINDOW,ip:readerIp,startedAt:now};s.lastReader={ip:readerIp,at:now};await save(s);
+return out(200,{status:'open',expiresAt:s.active.expiresAt,letter},{'Set-Cookie':COOKIE+'='+fresh+'; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900'})}catch{return out(503,{status:'unavailable'})}};
